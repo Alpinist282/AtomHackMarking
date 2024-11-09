@@ -314,8 +314,6 @@ plt.show()
 model.eval()
 with torch.no_grad():
     test_image_tensor = test_image.unsqueeze(0).to(device)
-<<<<<<< HEAD
-=======
     outputs = model(test_image_tensor)
     pred_text = decode_predictions(outputs, idx2char)
     print("Распознанный текст:", pred_text)
@@ -579,7 +577,6 @@ with torch.no_grad():
     plt.show()
     
     test_image_tensor = transformed_image.unsqueeze(0).to(device)
->>>>>>> 06e85a0 (Fixed branch)
     outputs = model(test_image_tensor)
     pred_text = decode_predictions(outputs, idx2char)
     print("Распознанный текст:", pred_text)
