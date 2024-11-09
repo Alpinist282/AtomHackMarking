@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
+import Levenshtein
+
 from sklearn.model_selection import train_test_split
 
 # Проверка доступности CUDA
@@ -159,21 +161,37 @@ class CRNN(nn.Module):
         output = self.fc(rnn_out)
         return output  # [w, batch_size, nclass]
     
+def decode_batch_predictions(outputs, idx2char):
+    # outputs: [T, N, C]
+    _, max_indices = outputs.max(2)  # [T, N]
+    max_indices = max_indices.transpose(1, 0)  # [N, T]
+    decoded_texts = []
+    for indices in max_indices:
+        pred_text = ''
+        prev_idx = None
+        for idx in indices:
+            idx = idx.item()
+            if idx != 0 and idx != prev_idx:
+                pred_text += idx2char.get(idx, '')
+            prev_idx = idx
+        decoded_texts.append(pred_text)
+    return decoded_texts
+
 def evaluate(model, dataloader):
     model.eval()
     total_loss = 0
+    total_cer = 0
+    total_wer = 0
+    num_samples = 0
     with torch.no_grad():
         for images, labels in dataloader:
             images = images.to(device)
             outputs = model(images)
             
-            # Подготовка меток (как в тренировочном цикле)
+            # Подготовка меток
             label_indices = []
             for label in labels:
-                indices = []
-                for char in label:
-                    if char in char2idx:
-                        indices.append(char2idx[char])
+                indices = [char2idx[char] for char in label if char in char2idx]
                 label_indices.append(indices)
             
             label_lengths = torch.tensor([len(label) for label in label_indices], dtype=torch.long).to(device)
@@ -184,14 +202,27 @@ def evaluate(model, dataloader):
             input_lengths = torch.full(size=(N,), fill_value=T, dtype=torch.long).to(device)
             
             # Преобразуем выходы для CTC Loss
-            outputs = outputs.log_softmax(2)
+            outputs_log_softmax = outputs.log_softmax(2)
             
             # Вычисление потерь
-            loss = criterion(outputs, label_tensor, input_lengths, label_lengths)
+            loss = criterion(outputs_log_softmax, label_tensor, input_lengths, label_lengths)
             total_loss += loss.item()
-        
+            
+            # Декодирование предсказаний
+            decoded_texts = decode_batch_predictions(outputs, idx2char)
+            
+            # Вычисление CER и WER
+            for pred_text, true_text in zip(decoded_texts, labels):
+                cer = Levenshtein.distance(pred_text, true_text) / max(len(true_text), 1)
+                wer = Levenshtein.distance(pred_text.split(), true_text.split()) / max(len(true_text.split()), 1)
+                total_cer += cer
+                total_wer += wer
+                num_samples += 1
+            
     avg_loss = total_loss / len(dataloader)
-    return avg_loss
+    avg_cer = total_cer / num_samples
+    avg_wer = total_wer / num_samples
+    return avg_loss, avg_cer, avg_wer
 
 # Параметры модели
 nh = 256  # размер скрытого состояния для RNN
@@ -212,11 +243,22 @@ if os.path.exists(model_path):
     start_epoch = checkpoint['epoch'] + 1
     print(f"Возобновление обучения с эпохи {start_epoch}")
 
+# Инициализация списков для хранения метрик
+train_losses = []
+train_cers = []
+train_wers = []
+test_losses = []
+test_cers = []
+test_wers = []
+
 # Цикл обучения
-num_epochs = 100
+num_epochs = 3
 for epoch in range(start_epoch, num_epochs):
     model.train()
     epoch_loss = 0
+    total_cer = 0
+    total_wer = 0
+    num_samples = 0
     for images, labels in train_loader:
         images = images.to(device)
         
@@ -228,12 +270,7 @@ for epoch in range(start_epoch, num_epochs):
         # Подготовка меток
         label_indices = []
         for label in labels:
-            indices = []
-            for char in label:
-                if char in char2idx:
-                    indices.append(char2idx[char])
-                else:
-                    print(f"Символ '{char}' не найден в словаре.")
+            indices = [char2idx[char] for char in label if char in char2idx]
             label_indices.append(indices)
         
         label_lengths = torch.tensor([len(label) for label in label_indices], dtype=torch.long).to(device)
@@ -244,21 +281,43 @@ for epoch in range(start_epoch, num_epochs):
         input_lengths = torch.full(size=(N,), fill_value=T, dtype=torch.long).to(device)
         
         # Преобразуем выходы для CTC Loss
-        outputs = outputs.log_softmax(2)
+        outputs_log_softmax = outputs.log_softmax(2)
         
         # Вычисление потери
-        loss = criterion(outputs, label_tensor, input_lengths, label_lengths)
+        loss = criterion(outputs_log_softmax, label_tensor, input_lengths, label_lengths)
         loss.backward()
         optimizer.step()
         
         epoch_loss += loss.item()
+        
+        # Декодирование предсказаний
+        decoded_texts = decode_batch_predictions(outputs, idx2char)
+        
+        # Вычисление CER и WER
+        for pred_text, true_text in zip(decoded_texts, labels):
+            cer = Levenshtein.distance(pred_text, true_text) / max(len(true_text), 1)
+            wer = Levenshtein.distance(pred_text.split(), true_text.split()) / max(len(true_text.split()), 1)
+            total_cer += cer
+            total_wer += wer
+            num_samples += 1
     
     avg_loss = epoch_loss / len(train_loader)
-    print(f"Epoch [{epoch+1}/{num_epochs}], Training Loss: {avg_loss:.4f}")
-    
-    # Оцениваем модель на тестовом наборе
-    test_loss = evaluate(model, test_loader)
-    print(f"Epoch [{epoch+1}/{num_epochs}], Test Loss: {test_loss:.4f}")
+    avg_cer = total_cer / num_samples
+    avg_wer = total_wer / num_samples
+
+    # В конце эпохи сохраняем метрики обучения
+    train_losses.append(avg_loss)
+    train_cers.append(avg_cer)
+    train_wers.append(avg_wer)
+
+     # Оцениваем модель на тестовом наборе
+    test_loss, test_cer, test_wer = evaluate(model, test_loader)
+    test_losses.append(test_loss)
+    test_cers.append(test_cer)
+    test_wers.append(test_wer)
+
+    print(f"Epoch [{epoch+1}/{num_epochs}], Training Loss: {avg_loss:.4f}, CER: {avg_cer:.4f}, WER: {avg_wer:.4f}")
+    print(f"Epoch [{epoch+1}/{num_epochs}], Test Loss: {test_loss:.4f}, CER: {test_cer:.4f}, WER: {test_wer:.4f}")
     
     # Сохраняем модель после каждой эпохи
     torch.save({
@@ -267,6 +326,42 @@ for epoch in range(start_epoch, num_epochs):
         'optimizer_state_dict': optimizer.state_dict(),
     }, model_path)
     print(f"Модель сохранена после эпохи {epoch+1}")
+
+# После завершения обучения строим графики
+import matplotlib.pyplot as plt
+
+epochs = range(1, num_epochs + 1)
+
+# График функции потерь
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 3, 1)
+plt.plot(epochs, train_losses, 'b-', label='Training Loss')
+plt.plot(epochs, test_losses, 'r-', label='Test Loss')
+plt.xlabel('Эпоха')
+plt.ylabel('Потери')
+plt.title('Потери на обучении и тесте по эпохам')
+plt.legend()
+
+# График CER
+plt.subplot(1, 3, 2)
+plt.plot(epochs, train_cers, 'b-', label='Training CER')
+plt.plot(epochs, test_cers, 'r-', label='Test CER')
+plt.xlabel('Эпоха')
+plt.ylabel('CER')
+plt.title('CER на обучении и тесте по эпохам')
+plt.legend()
+
+# График WER
+plt.subplot(1, 3, 3)
+plt.plot(epochs, train_wers, 'b-', label='Training WER')
+plt.plot(epochs, test_wers, 'r-', label='Test WER')
+plt.xlabel('Эпоха')
+plt.ylabel('WER')
+plt.title('WER на обучении и тесте по эпохам')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
 
 # Функция декодирования предсказаний
 def decode_predictions(outputs, idx2char):
@@ -277,7 +372,6 @@ def decode_predictions(outputs, idx2char):
         if preds[i] != 0 and (not (i > 0 and preds[i] == preds[i -1])):
             pred_text += idx2char[preds[i].item()]
     return pred_text
-
 
 # Пример инференса на тестовом изображении
 import random
