@@ -1,0 +1,8 @@
+# игнорирование виртуальных окружений
+venv/
+env/
+myenv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
