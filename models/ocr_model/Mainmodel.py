@@ -1,135 +1,132 @@
 import os
+import pandas as pd
+import cv2
 import torch
-import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from PIL import Image, UnidentifiedImageError
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
 
-# Определим набор символов
-SYMBOL_SET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzAБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя0123456789. "
+from PIL import Image
+import matplotlib.pyplot as plt
 
-# Определим класс для загрузки данных
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 class OCRDataset(Dataset):
-    def __init__(self, image_dir, label_dir, transform=None):
+    def __init__(self, csv_file, image_dir, transform=None):
+        self.annotations = pd.read_csv(csv_file)
         self.image_dir = image_dir
-        self.label_dir = label_dir
         self.transform = transform
-        self.image_files = [f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
     def __len__(self):
-        return len(self.image_files)
+        return len(self.annotations)
 
     def __getitem__(self, idx):
-        img_name = self.image_files[idx]
-        img_path = os.path.join(self.image_dir, img_name)
-        label_path = os.path.join(self.label_dir, os.path.splitext(img_name)[0] + '.txt')
-
-        if not os.path.exists(label_path):
-            print(f"Label file not found: {label_path}")
-            return None
-
-        try:
-            image = Image.open(img_path).convert('L')
-        except UnidentifiedImageError:
-            print(f"Unidentified image file: {img_path}")
-            return None
-
+        img_path = os.path.join(self.image_dir, self.annotations.iloc[idx, 0])
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Bounding box и текстовая метка
+        boxes = self.annotations.iloc[idx, 1].strip().split("\n")
+        label_text = self.annotations.iloc[idx, 2]
+        
         if self.transform:
-            image = self.transform(image)
+            augmented = self.transform(image=image)
+            image = augmented['image']
 
-        with open(label_path, 'r') as f:
-            label = f.read().strip()
+        return image, label_text
+    
 
-        # Проверка на наличие неожиданных символов
-        for c in label:
-            if c not in SYMBOL_SET:
-                print(f"Unexpected character '{c}' in label file: {label_path}")
-                return None
-
-        label = [SYMBOL_SET.index(c) for c in label]
-        label = torch.tensor(label, dtype=torch.long)
-
-        return image, label
-
-# Преобразования для изображений
-transform = transforms.Compose([
-    transforms.Resize((1280, 720)),
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
+train_transform = A.Compose([
+    A.Resize(128, 128),
+    A.RandomBrightnessContrast(p=0.2),
+    A.Rotate(limit=15, p=0.5),
+    A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    ToTensorV2()
 ])
 
-# Создание DataLoader
-train_dataset = OCRDataset(image_dir='/home/user1/AtomHackMarking-1/train/imgs', label_dir='/home/user1/AtomHackMarking-1/train/labels', transform=transform)
-
-def collate_fn(batch):
-    batch = [item for item in batch if item is not None]
-    if len(batch) == 0:
-        return None
-    images, labels = zip(*batch)
-    return torch.stack(images), torch.stack(labels)
-
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
-
-# Определение модели
-class MyNet(nn.Module):
-    def __init__(self):
-        super(MyNet, self).__init__()
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 40, 3, padding=1),
-            nn.MaxPool2d(2),
-            nn.ReLU(),
-            nn.Conv2d(40, 60, 3, padding=1),
-            nn.MaxPool2d(2),
-            nn.ReLU(),
+class CRNN(nn.Module):
+    def __init__(self, imgH, nc, nclass, nh):
+        super(CRNN, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(nc, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # 64x64x64
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # 128x32x32
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            nn.MaxPool2d(kernel_size=(32, 1), stride=(32, 1))  # добавляем MaxPool для высоты
         )
-
-        self.avgpool = nn.AdaptiveAvgPool2d((1, None))
-
-        self.classifier = nn.Linear(60, len(SYMBOL_SET))
-        self.log_softmax = nn.LogSoftmax(dim=2)
+        self.rnn = nn.LSTM(256, nh, bidirectional=True)
+        self.fc = nn.Linear(nh * 2, nclass)
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.avgpool(x)
-        x = x.permute(0, 3, 1, 2).view(x.size(0), x.size(3), -1)
-        x = self.classifier(x)
-        x = x.permute(1, 0, 2)
-        x = self.log_softmax(x)
-        return x
+        conv = self.cnn(x)
+        b, c, h, w = conv.size()
+        assert h == 1, f"Unexpected height {h} in feature map after CNN layers, expected 1."
+        conv = conv.squeeze(2)
+        conv = conv.permute(2, 0, 1)
+        rnn_out, _ = self.rnn(conv)
+        output = self.fc(rnn_out)
+        return output
     
-model = MyNet()
+
+# Параметры модели
+num_classes = len(set("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюяABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-/ "))  # все символы, которые могут встречаться
+nh = 256  # скрытые слои для RNN
+
+# Инициализация модели, функции потерь и оптимизатора
+model = CRNN(imgH=128, nc=3, nclass=num_classes, nh=nh).to(device)
+criterion = nn.CTCLoss(blank=0)
+optimizer = optim.Adam(model.parameters(), lr=0.0001)
+
+# DataLoader
+train_data = OCRDataset(csv_file='/home/user1/AtomHackMarking-3/models/ocr_model/train/grounded true train.csv', image_dir='/home/user1/AtomHackMarking-3/models/ocr_model/train/train/imgs', transform=train_transform)
+train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
 
 
-# Определение функции потерь и оптимизатора
-criterion = nn.CTCLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+# Тест
+test_image_path = "models/ocr_model/train/train/imgs/19.JPG"
 
-# Обучение модели
-num_epochs = 10
-for epoch in range(num_epochs):
+# Цикл обучения
+for epoch in range(20):
     model.train()
-    for batch in train_loader:
-        if batch is None:
-            continue
-        images, labels = batch
-
+    for images, labels in train_loader:
+        images = images.to(device)
+        
         optimizer.zero_grad()
-
-        # Предсказание
+        
+        # Предсказания модели
         outputs = model(images)
+        
+        # Определение максимальной длины меток в текущем батче
+        max_length = max(len(label) for label in labels)
 
-        # Вычисление потерь
+        # Преобразуем метки в тензоры с учетом паддинга
+        label_tensor = torch.tensor(
+            [
+                [ord(char) - ord(' ') for char in label] + [0] * (max_length - len(label))
+                for label in labels
+            ],
+            dtype=torch.long
+        )
+        label_lengths = torch.tensor([len(label) for label in labels], dtype=torch.long)
+
+        # Длины выходных предсказаний
         input_lengths = torch.full(size=(outputs.size(1),), fill_value=outputs.size(0), dtype=torch.long)
-        target_lengths = torch.tensor([len(label) for label in labels], dtype=torch.long)
-        loss = criterion(outputs, labels, input_lengths, target_lengths)
 
-        # Обратное распространение и оптимизация
+        # Вычисляем потерю
+        loss = criterion(outputs, label_tensor, input_lengths, label_lengths)
         loss.backward()
         optimizer.step()
 
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
-
-# Сохранение модели
-torch.save(model.state_dict(), 'ocr_model.pth')
+    print(f"Epoch [{epoch+1}/10], Loss: {loss.item():.4f}")
