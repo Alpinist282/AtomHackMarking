@@ -61,7 +61,7 @@ num_classes = len(all_characters) + 1  # +1 для blank label
 
 indices = list(range(len(full_data)))
 
-train_indices, test_indices = train_test_split(indices, test_size=0.2, random_state=42)
+train_indices, test_indices = train_test_split(indices, test_size=0.2, random_state=42) #разделение!
 
 # Теперь можно создать трансформации и загрузчики данных
 train_transform = A.Compose([
@@ -229,7 +229,7 @@ if os.path.exists(model_path):
     print(f"Возобновление обучения с эпохи {start_epoch}")
 
 # Цикл обучения
-num_epochs = 20
+num_epochs = 100
 for epoch in range(start_epoch, num_epochs):
     model.train()
     epoch_loss = 0
